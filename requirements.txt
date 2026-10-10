@@ -1,0 +1,17 @@
+# Great White Planet 运行依赖
+#
+# 安装（在 code 目录下执行）：
+#     venv\Scripts\python.exe -m pip install -r requirements.txt
+# 或直接双击「安装依赖.bat」。
+#
+# 核心依赖（缺了软件无法运行）
+PyQt6>=6.6
+
+# 功能依赖（缺失时对应功能自动降级，并在「工具 → 依赖自检」中提示）
+markdown>=3.4          # Markdown 渲染与 PDF 导出
+pygments>=2.15         # 代码块语法高亮
+pymupdf>=1.23          # PDF 解析 / 扫描件转图片 / PDF 导出
+python-docx>=1.0       # docx 教材与笔记解析
+python-pptx>=0.6.21    # pptx 解析（需求文档第十二节的扩展规划）
+openpyxl>=3.1          # xlsx 解析（同上）
+pillow>=10.0           # 图片缩放与格式转换

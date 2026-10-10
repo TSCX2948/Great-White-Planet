@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# 不上传的东西
+#
+# 这个仓库只放**源码 + 文档**。安装包通过 GitHub Releases 单独发布
+# （见 打包说明.md），所以不进 git 历史 —— 每次更新都提交一份 70 MB 的
+# 二进制，历史会迅速膨胀到几个 GB，而且再也删不掉。
+# ---------------------------------------------------------------------------
+
+# --- 私人数据（绝对不能上传）---
+# data/ 里有用户的书目、笔记、错题，以及 else data/secrets.json（API 密钥）
+data/
+**/secrets.json
+**/instance.lock
+**/wake.request
+*.log
+
+# --- 虚拟环境（用 requirements.txt 重建）---
+venv/
+.venv/
+env/
+
+# --- Python 产物 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 打包产物（安装包走 Releases，不提交）---
+*.exe
+*.msi
+installer_stage/
+payload.zip
+/安装包/
+/DeepseekData/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- 临时文件 ---
+*.tmp
+*.bak
+*.orig
+*.rej
+*_summary.pdf
+*_summary.md.tmp
