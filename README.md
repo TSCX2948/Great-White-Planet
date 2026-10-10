@@ -1,4 +1,4 @@
-# Great White Planet（大白星球）
+# Great White Planet（太白金星）
 
 > 本地知识管理与 AI 辅助学习软件。管理课程、教材、笔记、错题，
 > 把散落的资料**合并成一份可以直接用来复习的 PDF**。
