@@ -19,8 +19,8 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `Great White Planet v2.1 安装包.zip` | **安装程序**。解压后双击 `安装 Great White Planet.exe` |
-| `Great White Planet v2.1 win11-bit64.zip` | **免安装绿色版** + 说明文档。解压即用 |
+| `Great.White.Planet.v2.1.zip` | **安装程序**。解压后双击 `安装 Great White Planet.exe` |
+| `Great.White.Planet.v2.1.win11-bit64.zip` | **免安装绿色版** + 说明文档。解压即用 |
 
 安装包**自带 Python 运行时** —— 你的电脑**不需要**预装 Python。
 
