@@ -182,7 +182,11 @@ venv\Scripts\python.exe installer\acceptance.py            :: 5. 验收
 
 只改了逻辑、没动界面时，跳过第 2、3 步即可。
 
-版本号在 `gwp\core\constants.py` 的 `APP_VERSION`，改它会同步到窗口标题与日志。
+版本号在 `gwp\__init__.py` 的 `__version__`（**唯一来源**），
+改它会同步到窗口标题、关于框、日志与安装包信息。
+
+> 这里原先写的是 `gwp\core\constants.py` 的 `APP_VERSION` —— 那是旧版本的位置，
+> 早就搬到 `gwp\__init__.py` 了。按旧说明去找会找不到，所以更正一下。
 
 ## 附：开发实践书稿的排版
 

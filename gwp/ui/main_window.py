@@ -33,6 +33,7 @@ from gwp import __app_name__, __version__
 from gwp.bootstrap import AppContext, cleanup_on_exit
 from gwp.core import constants as C
 from gwp.core.eventbus import AI_FALLBACK, STATUS_MESSAGE, bus
+from gwp.data_manager import forum_store
 from gwp.services import dependencies, file_ops, shell_ops, themes
 from gwp.ui import common
 from gwp.ui.dialogs.book_dialog import BookDialog
@@ -289,12 +290,16 @@ class MainWindow(QMainWindow):
         self._add_action(menu, "打开配置文件", self.open_config_file)
         self._add_action(menu, "恢复默认设置（保留数据）…", self.reset_settings)
 
-        # 论坛：点一下用系统默认浏览器打开
-        menu = bar.addMenu("论坛(&O)")
-        self._add_action(
-            menu, "牢大CS", lambda: self.open_forum("牢大CS"),
-            tooltip="用系统默认浏览器打开 https://cs9.x-way.work/",
-        )
+        # 论坛：用户自己维护的列表（名称 + 网址），点一下用系统默认浏览器打开
+        #
+        # 需求："论坛添加新增/删除论坛功能，需要用户提供论坛名称 网址"
+        #
+        # 菜单**每次展开时重建**（见 `_rebuild_forum_menu`）：
+        # 增删改之后不用重启软件就能看到新的一项。
+        self.menu_forum = bar.addMenu("论坛(&O)")
+        # 每次展开都重建：增删改之后立刻生效，不用重启软件
+        self.menu_forum.aboutToShow.connect(self._rebuild_forum_menu)
+        self._rebuild_forum_menu()
 
         # 帮助
         menu = bar.addMenu("帮助(&H)")
@@ -330,24 +335,154 @@ class MainWindow(QMainWindow):
         return action
 
     # ==================================================================
-    # 论坛
+    # 论坛（用户自己维护的列表）
     # ==================================================================
 
-    def forum_url(self, key: str = "laoda_cs") -> str:
-        """从配置里取论坛地址（不写死在代码里，方便以后改）。"""
-        default = "https://cs9.x-way.work/"
-        if key == "laoda_cs":
-            return str(self.context.config.get("forum.laoda_cs_url", default) or default)
-        return default
+    def _forum_list(self) -> list:
+        """读出论坛列表（含老配置搬家，见 data_manager/forum_store）。"""
+        try:
+            return forum_store.load(self.context.config)
+        except Exception:  # noqa: BLE001 - 配置坏了不该让菜单炸掉
+            log.exception("读取论坛列表失败")
+            return []
 
-    def open_forum(self, title: str = "牢大CS") -> None:
-        """用系统默认浏览器打开论坛。
+    def _rebuild_forum_menu(self) -> None:
+        """重建「论坛」菜单。
+
+        每次展开时重建（`aboutToShow`），所以增删改**立刻生效**，
+        不需要重启软件 —— 用户加完一个论坛马上就能点。
+        """
+        menu = getattr(self, "menu_forum", None)
+        if menu is None:
+            return
+        menu.clear()
+        forums = self._forum_list()
+
+        if not forums:
+            menu.addAction("（还没有论坛，点下面「新增论坛…」）").setEnabled(False)
+        for index, forum in enumerate(forums):
+            action = menu.addAction(forum.name)
+            action.setToolTip(f"用系统默认浏览器打开 {forum.url}")
+            action.triggered.connect(
+                lambda _checked=False, f=forum: self.open_forum(f.name, f.url)
+            )
+            # 右键某个论坛 -> 编辑 / 删除 / 调顺序
+            action.setData(forum)
+        if forums:
+            menu.addSeparator()
+            sub = menu.addMenu("编辑 / 删除")
+            for forum in forums:
+                item = sub.addMenu(forum.name)
+                item.addAction(
+                    "编辑…",
+                    lambda _c=False, f=forum: self.edit_forum(f),
+                )
+                item.addAction(
+                    "删除…",
+                    lambda _c=False, f=forum: self.delete_forum(f),
+                )
+                item.addSeparator()
+                item.addAction(
+                    "上移",
+                    lambda _c=False, f=forum: self.move_forum(f, -1),
+                )
+                item.addAction(
+                    "下移",
+                    lambda _c=False, f=forum: self.move_forum(f, +1),
+                )
+        menu.addSeparator()
+        menu.addAction("新增论坛…", self.add_forum)
+
+    def add_forum(self) -> None:
+        """菜单「新增论坛…」：问名称 + 网址，然后存进配置。"""
+        from gwp.ui.dialogs.forum_dialog import ForumDialog
+
+        taken = [f.name for f in self._forum_list()]
+        if len(taken) >= forum_store.MAX_FORUMS:
+            common.warn(
+                self,
+                f"最多只能有 {forum_store.MAX_FORUMS} 个论坛。\n"
+                "想加新的，先删掉几个不用的。",
+                "无法新增",
+            )
+            return
+        dialog = ForumDialog(self, taken=taken)
+        if dialog.exec() != ForumDialog.DialogCode.Accepted:
+            return
+        forum = dialog.result_forum()
+        try:
+            forum_store.add(self.context.config, forum.name, forum.url)
+        except Exception as exc:  # noqa: BLE001 - 写配置失败要说清楚
+            log.exception("保存论坛失败")
+            common.error(self, f"保存失败：{exc}", "无法新增论坛")
+            return
+        self._rebuild_forum_menu()
+        self.statusBar().showMessage(f"已新增论坛：{forum.name}", 4000)
+
+    def edit_forum(self, forum) -> None:
+        """改某个论坛的名称或网址（就地替换，保持它在列表里的位置）。"""
+        from gwp.ui.dialogs.forum_dialog import ForumDialog
+
+        taken = [f.name for f in self._forum_list()]
+        dialog = ForumDialog(self, existing=forum, taken=taken)
+        if dialog.exec() != ForumDialog.DialogCode.Accepted:
+            return
+        updated = dialog.result_forum()
+        try:
+            forum_store.rename(
+                self.context.config, forum.name, updated.name, updated.url
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("修改论坛失败")
+            common.error(self, f"保存失败：{exc}", "无法修改论坛")
+            return
+        self._rebuild_forum_menu()
+        self.statusBar().showMessage(f"已保存论坛：{updated.name}", 4000)
+
+    def delete_forum(self, forum) -> None:
+        """删一个论坛。**先确认**（误点删掉就得重新输名称和网址）。"""
+        if not common.confirm(
+            self,
+            f"确定删除论坛「{forum.name}」吗？\n\n"
+            f"它指向：{forum.url}\n\n"
+            "（只是从菜单里去掉，不会影响那个网站本身。之后想加回来，"
+            "重新填一次名称和网址即可。）",
+            "删除论坛",
+            dangerous=True,
+        ):
+            return
+        try:
+            forum_store.remove(self.context.config, forum.name)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("删除论坛失败")
+            common.error(self, f"删除失败：{exc}", "无法删除论坛")
+            return
+        self._rebuild_forum_menu()
+        self.statusBar().showMessage(f"已删除论坛：{forum.name}", 4000)
+
+    def move_forum(self, forum, delta: int) -> None:
+        """把论坛在菜单里上移/下移（菜单顺序 = 列表顺序）。"""
+        try:
+            forum_store.move(self.context.config, forum.name, delta)
+        except Exception:  # noqa: BLE001 - 顺序调不动不是大事
+            log.exception("调整论坛顺序失败")
+            return
+        self._rebuild_forum_menu()
+
+    def open_forum(self, title: str = "", url: str = "") -> None:
+        """用系统默认浏览器打开一个论坛。
 
         用浏览器打开是**最省事、最不容易出问题**的做法：
         登录态、Cookie、字体、脚本全都和用户平时上网一致，
         不用担心内嵌内核的兼容性；代价只是会多一个浏览器窗口。
         """
-        url = self.forum_url("laoda_cs")
+        if not url:
+            # 兼容老调用：没给网址就按名称去列表里找
+            found = next((f for f in self._forum_list() if f.name == title), None)
+            if found is None:
+                common.warn(self, f"找不到论坛「{title}」。", "打开论坛失败")
+                return
+            url = found.url
         if not shell_ops.open_url(url):
             common.warn(
                 self,
@@ -355,7 +490,7 @@ class MainWindow(QMainWindow):
                 "打开论坛失败",
             )
             return
-        self.statusBar().showMessage(f"已在浏览器中打开：{title}", 4000)
+        self.statusBar().showMessage(f"已在浏览器中打开：{title or url}", 4000)
 
     def _rebuild_ai_menu(self) -> None:
         """AI 菜单每次展开时重建，保证提供方状态是最新的。"""
@@ -705,8 +840,13 @@ class MainWindow(QMainWindow):
         self._refresh_corner_button()
 
     def _on_fallback(self, from_provider: str = "", to_provider: str = "", to_label: str = "", reason: str = "", **_kwargs) -> None:
-        self.show_status(f"已切换到兜底 AI：{to_label or to_provider}")
-        self.refresh_status()
+        # 这条通知可能来自**后台线程**（AIWorker 里调 chat_with_fallback，
+        # 主 AI 失败时会发事件）。状态栏是控件，必须在 GUI 线程里改。
+        def _apply() -> None:
+            self.show_status(f"已切换到兜底 AI：{to_label or to_provider}")
+            self.refresh_status()
+
+        common.run_in_gui(self, _apply)
 
     # ==================================================================
     # 导航

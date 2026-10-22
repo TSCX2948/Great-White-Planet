@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from PyQt6.QtCore import Qt, QTimer
+from typing import Callable
+
+from PyQt6.QtCore import QThread, Qt, QTimer
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,18 +35,89 @@ NO = QMessageBox.StandardButton.No
 
 
 # --------------------------------------------------------------------------
+# 线程
+# --------------------------------------------------------------------------
+
+def is_gui_thread() -> bool:
+    """当前是不是在 GUI 线程上。"""
+    try:
+        app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            return True          # 没有界面就当"无所谓"
+        return QThread.currentThread() is app.thread()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def run_in_gui(context: QWidget | None, fn: Callable[[], None]) -> None:
+    """保证 ``fn`` 在 **GUI 线程**执行。
+
+    为什么需要它：后台线程（``AIWorker``）里也会触发事件总线上的通知，
+    比如"主 AI 不可用，已切换到兜底" —— 处理函数里要更新状态栏、弹提示框。
+    **在非 GUI 线程里建控件或改控件都是不允许的**，轻则界面错乱，
+    重则进程直接中止。
+
+    ``context`` 必须是活着的 GUI 对象：它决定定时器挂在哪个线程上。
+    PyQt6 的 ``QTimer.singleShot(ms, context, functor)`` 在 ``context``
+    所属线程的事件循环里执行 functor，所以从工作线程调用也能安全回到界面线程。
+    """
+    if is_gui_thread() or context is None:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            log.debug("GUI 线程回调失败", exc_info=True)
+        return
+    try:
+        QTimer.singleShot(0, context, fn)
+    except Exception:  # noqa: BLE001 - 兜底：直接调用（可能不安全，但总比静默丢弃好）
+        log.warning("切回 GUI 线程失败，直接执行", exc_info=True)
+        fn()
+
+
+# --------------------------------------------------------------------------
 # 消息框
 # --------------------------------------------------------------------------
 
+def has_gui() -> bool:
+    """当前进程里有没有可用的 **QApplication**（不只是 QCoreApplication）。
+
+    为什么需要它：Qt **不允许在没有 QApplication 时创建任何 QWidget**，
+    而且它不是抛 Python 异常 —— 是直接打印
+    ``QWidget: Cannot create a QWidget without QApplication`` 然后
+    **中止进程**（Windows 上退出码 ``0xC0000409``，日志里什么都留不下）。
+
+    ⚠️ **判据必须严格是 `QApplication`，不能只看"有没有 app 实例"**：
+    ``QApplication.instance()`` 在只创建了 ``QCoreApplication`` 时**也会返回非空**
+    （某些 Qt 模块导入或测试代码会建一个）。实测踩到过这个坑：
+    用 `instance() is not None` 判断，结果 `has_gui()` 返回 True，
+    于是放心去建 QMessageBox —— 进程当场中止。
+    正确写法是显式 ``isinstance(app, QApplication)``。
+    """
+    try:
+        app = QApplication.instance()
+        return isinstance(app, QApplication)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def info(parent: QWidget | None, text: str, title: str = "提示") -> None:
+    if not has_gui():
+        log.info("[%s] %s", title, text)
+        return
     QMessageBox.information(parent, title, text)
 
 
 def warn(parent: QWidget | None, text: str, title: str = "注意") -> None:
+    if not has_gui():
+        log.warning("[%s] %s", title, text)
+        return
     QMessageBox.warning(parent, title, text)
 
 
 def error(parent: QWidget | None, text: str, title: str = "出错了") -> None:
+    if not has_gui():
+        log.error("[%s] %s", title, text)
+        return
     QMessageBox.critical(parent, title, text)
 
 
@@ -67,7 +140,14 @@ def confirm(
 
     ``detail`` 会显示在详细信息区（可折叠），用来放路径、内容清单这类
     用户需要但不该占据主视线的东西。
+
+    **没有 QApplication 时一律返回 False（视为"取消"）** ——
+    见 :func:`has_gui` 的说明。这个默认方向是有意的：
+    无人确认时**不做**破坏性操作，比"没问就做了"安全得多。
     """
+    if not has_gui():
+        log.warning("[%s] %s（无界面，按「取消」处理）", title, text)
+        return False
     box = QMessageBox(parent)
     box.setWindowTitle(title)
     box.setText(text)

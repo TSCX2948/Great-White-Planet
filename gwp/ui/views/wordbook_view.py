@@ -8,9 +8,20 @@
 这一页和别的标签不一样：它不是文件表格，而是**一列可折叠卡片**。
 所以它不走 ``FileTable``，而是自己的滚动列表（见 ``widgets/word_card.py``）。
 
-AI 补齐走的是"能力判断收在一处"的老路：有可用的 AI 就直接补齐，
-没有就退化成"把提示词复制到剪贴板、你把回答粘回来"
-（复用 ``common.ask_paste_reply``，与附件/图片提取一致）。
+**AI 补齐必须在后台线程跑**（v2.1 修的一个真 bug）：
+
+原来是在界面线程里同步调用 AI —— 单张会"点一下卡半天"，
+「补齐全部」更是逐张串行请求，N 张卡就把界面冻住 N 次网络往返的时间
+（用户报障："单词补齐功能障碍，会导致程序卡死"）。
+
+现在照 AI summary 的做法走 ``AIWorker``：
+
+* 后台线程只负责**取 AI 的回答**（``send_to_ai(allow_paste=False)``）；
+* 界面线程负责**解析、合并、读写卡片文件**（磁盘 IO 很快，不会卡）；
+* 进度通过信号回到界面，可随时取消。
+
+只有"网页版粘贴"那条路仍留在界面线程 —— 它本来就要等用户手动操作，
+而且**绝不能**在后台线程里弹窗（Qt 不允许在非 GUI 线程建控件）。
 """
 
 from __future__ import annotations
@@ -29,6 +40,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from gwp.ai.providers import web_bridge
+from gwp.ai.worker import AIWorker
 from gwp.core.eventbus import BOOK_CONTENT_CHANGED, bus
 from gwp.data_manager import wordbook
 from gwp.data_manager.wordbook import WordCard
@@ -52,6 +65,12 @@ class WordbookView(QWidget):
         self._widgets: list[WordCardWidget] = []
         #: 展开状态按"英文"记住，刷新后不丢（刷新是常事：补齐一张就刷一次）
         self._expanded: set[str] = set()
+        #: 正在跑补齐任务的后台线程（None = 没在跑）
+        self._worker: AIWorker | None = None
+        #: 补齐进度框（只有"补齐全部"才弹）
+        self._busy: common.BusyDialog | None = None
+        #: 本次补齐是否强制覆盖已有字段（由 _start_completion 设置）
+        self._completion_force: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -255,10 +274,39 @@ class WordbookView(QWidget):
     # AI 补齐
     # ==================================================================
 
+    @property
+    def is_completing(self) -> bool:
+        """是否有补齐任务在跑（测试与按钮状态都用它）。"""
+        worker = self._worker
+        try:
+            return worker is not None and worker.isRunning()
+        except RuntimeError:          # 底层 C++ 对象已销毁
+            return False
+
+    def _direct_ai_available(self) -> bool:
+        """现在能不能**直接调用** AI（不用手工粘贴）。"""
+        try:
+            return web_bridge.has_direct_provider(self.context,
+                                                  self._active_provider_id())
+        except Exception:  # noqa: BLE001
+            return False
+
     def complete_card(self, card: WordCard, *, force: bool = False) -> bool:
-        """补齐一张卡。返回是否成功写入了内容。"""
+        """补齐一张卡。返回**是否已发起**。
+
+        **这个函数不再阻塞界面**：AI 调用在后台线程，结果通过信号回来。
+        原来的实现是在界面线程里同步调 API —— 网络一慢，界面就假死
+        （用户报障："单词补齐功能障碍，会导致程序卡死"）。
+
+        例外：如果当前**只能走网页版粘贴**，会留在界面线程里同步完成。
+        那种流程本来就要等用户手动复制粘贴，是用户主动参与的模态过程；
+        而且它**绝不能**放到后台线程——Qt 不允许在非 GUI 线程建控件。
+        """
         folder = self.folder()
         if folder is None:
+            return False
+        if self.is_completing:
+            self.status_message.emit("正在补齐中，请稍等…")
             return False
         card = wordbook.find_card(folder, card.english) or card
         if card.locked and not force:
@@ -270,9 +318,18 @@ class WordbookView(QWidget):
             )
             return False
 
-        prompt = wordbook.build_prompt(card.english)
-        from gwp.ai.providers import web_bridge
+        if self._direct_ai_available():
+            self._start_completion([card], force=force, batch=False)
+            return True
+        return self._complete_via_paste(card, force=force)
 
+    def _complete_via_paste(self, card: WordCard, *, force: bool = False) -> bool:
+        """走「复制提示词 + 让用户粘贴回答」这条路（**必须在 GUI 线程**）。"""
+        folder = self.folder()
+        if folder is None:
+            return False
+
+        prompt = wordbook.build_prompt(card.english)
         try:
             reply = web_bridge.send_to_ai(
                 prompt,
@@ -320,35 +377,194 @@ class WordbookView(QWidget):
         self._announce_and_notify(folder)
         return True
 
-    def complete_all(self) -> None:
-        """把还没有内容的卡片逐张补齐。"""
+    # -- 后台补齐 -------------------------------------------------------
+
+    def _start_completion(
+        self, cards: list[WordCard], *, force: bool, batch: bool
+    ) -> None:
+        """起一个后台任务去取 AI 回答（界面线程只等信号）。"""
+        folder = self.folder()
+        if folder is None or not cards:
+            return
+        names = [card.english for card in cards]
+        total = max(1, len(names))
+        provider_id = self._active_provider_id()
+        context = self.context
+
+        def task(*, on_progress=None, should_cancel=None, **_kwargs):
+            """在线程里跑：**只取回答，不碰界面、不碰文件**。"""
+            results: list[tuple[str, str, str]] = []
+            for index, name in enumerate(names, 1):
+                if should_cancel is not None and should_cancel():
+                    log.info("单词补齐被取消（已完成 %d/%d）", index - 1, total)
+                    break
+                if on_progress is not None:
+                    on_progress(
+                        f"正在补齐 {index}/{total}：{name}",
+                        int((index - 1) * 100 / total),
+                        name,
+                    )
+                try:
+                    reply = web_bridge.send_to_ai(
+                        wordbook.build_prompt(name),
+                        provider_id=provider_id,
+                        context=context,
+                        parent=None,
+                        title=f"补齐单词：{name}",
+                        # **后台线程绝不能弹粘贴框**（Qt 不允许非 GUI 线程建控件），
+                        # 批量时还会开一堆浏览器窗口。
+                        allow_paste=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 单张失败继续下一张
+                    log.warning("补齐 %s 失败：%s", name, exc, exc_info=True)
+                    results.append((name, "", str(exc)))
+                    continue
+                results.append((name, (reply or "").strip(), ""))
+            if on_progress is not None:
+                on_progress("整理结果…", 100, "")
+            return results
+
+        worker = AIWorker(task, parent=self, label="补齐单词")
+        worker.progress.connect(self._on_completion_progress)
+        # 注意：这里连的是**成员方法**而不是 lambda。
+        # 跨线程信号要投递回 GUI 线程，需要一个 QObject 接收者来确定线程归属；
+        # 连普通函数/lambda 时 PyQt 的线程语义更微妙（可能变成直接调用，
+        # 那就等于在后台线程里改界面了）。用成员方法最稳。
+        self._completion_force = force
+        worker.finished_ok.connect(self._on_completion_finished)
+        worker.failed.connect(self._on_completion_failed)
+        worker.cancelled.connect(self._on_completion_cancelled)
+        self._worker = worker
+        self._set_completing_ui(True)
+        if batch:
+            self._busy = common.BusyDialog(self, "正在补齐单词", "准备中…")
+            self._busy.canceled.connect(self._cancel_completion)
+            self._busy.show()
+        else:
+            self._busy = None
+            self.status_message.emit("正在让 AI 补齐…")
+        worker.start()
+
+    def _on_completion_progress(self, message: str, percent: int, detail: str) -> None:
+        if self._busy is not None:
+            self._busy.report(message, percent, detail)
+        else:
+            self.status_message.emit(message)
+
+    def _on_completion_finished(self, results) -> None:
+        """回到界面线程后才写文件（磁盘 IO 很快，不会卡）。"""
+        self._close_busy()
+        self._set_completing_ui(False)
+        force = bool(getattr(self, "_completion_force", False))
         folder = self.folder()
         if folder is None:
+            return
+        done = 0
+        skipped: list[str] = []
+        for name, text, error in (results or []):
+            if error or not text:
+                skipped.append(name)
+                continue
+            card = wordbook.find_card(folder, name)
+            if card is None:
+                skipped.append(name)
+                continue
+            fresh, parse_error = wordbook.parse_completion(text, name)
+            if fresh is None or parse_error:
+                # 解析不了 / AI 说查不到 -> **不写入**，避免污染卡片
+                skipped.append(name)
+                continue
+            merged = wordbook.merge_into(
+                wordbook.WordCard.from_dict(card.to_dict()), fresh, force=force
+            )
+            merged.note = card.note
+            merged.locked = card.locked
+            try:
+                wordbook.save_card(merged, folder)
+            except OSError as exc:
+                log.warning("保存 %s 失败：%s", name, exc, exc_info=True)
+                skipped.append(name)
+                continue
+            done += 1
+
+        total = len(results or [])
+        self.refresh()
+        self._announce_and_notify(folder)
+        self.status_message.emit(f"补齐完成：成功 {done} / {total} 张")
+        if skipped:
+            common.info(
+                self,
+                f"成功补齐 {done} 张，跳过 {len(skipped)} 张"
+                f"（{'、'.join(skipped[:6])}"
+                f"{' 等' if len(skipped) > 6 else ''}）。\n\n"
+                "被跳过的卡片仍可右键单独补齐，或右键「编辑…」手动填写。",
+                "补齐完成",
+            )
+
+    def _on_completion_failed(self, message: str) -> None:
+        self._close_busy()
+        self._set_completing_ui(False)
+        log.warning("单词补齐任务失败：%s", message)
+        common.error(self, f"补齐失败：{message}", "AI 补齐失败")
+
+    def _on_completion_cancelled(self) -> None:
+        self._close_busy()
+        self._set_completing_ui(False)
+        self.status_message.emit("已取消补齐")
+
+    def _cancel_completion(self) -> None:
+        if self._worker is not None:
+            try:
+                self._worker.cancel()
+            except RuntimeError:
+                pass
+
+    def _close_busy(self) -> None:
+        if self._busy is not None:
+            try:
+                self._busy.close()
+            except RuntimeError:
+                pass
+            self._busy = None
+
+    def _set_completing_ui(self, active: bool) -> None:
+        """补齐期间禁用会并发触发第二次补齐的按钮。"""
+        for button in (getattr(self, "btn_add", None),
+                       getattr(self, "btn_complete", None)):
+            if button is not None:
+                button.setEnabled(not active)
+
+    def complete_all(self) -> None:
+        """把还没有内容的卡片逐张补齐（**后台线程**，界面不卡）。"""
+        folder = self.folder()
+        if folder is None:
+            return
+        if self.is_completing:
+            common.info(self, "正在补齐中，请稍等…", "请稍候")
             return
         pending = [card for card in self.cards if not card.completed]
         if not pending:
             common.info(self, "所有单词卡都已有内容了。", "无需补齐")
             return
+        if not self._direct_ai_available():
+            # 批量时绝不能让每张卡都弹一次粘贴框（会开 N 个浏览器窗口）。
+            common.info(
+                self,
+                "「补齐全部」需要能**直接调用**的 AI。\n\n"
+                "请到「AI → AI 设置」里填一个 API Key（DeepSeek / GPT / 自定义）。\n"
+                "只配了网页版时，请逐张右键「AI 补齐」—— 那样每张都需要你粘贴回答。",
+                "需要配置 API",
+            )
+            return
         if not common.confirm(
             self,
             f"有 {len(pending)} 张卡还没有中文解释。\n\n"
-            "会**逐张**让 AI 补齐（每张都要等一会儿）。现在开始吗？",
+            "会在**后台**逐张让 AI 补齐，进度框里可以随时取消。现在开始吗？",
             "补齐全部",
-            detail="中途可以关掉弹窗来跳过某一张。",
+            detail="补齐过程中界面可以继续用，但别关掉软件。",
         ):
             return
-        done = 0
-        for card in pending:
-            if self.complete_card(card):
-                done += 1
-        self.status_message.emit(f"补齐完成：成功 {done} / {len(pending)} 张")
-        if done < len(pending):
-            common.info(
-                self,
-                f"成功补齐 {done} 张，跳过 {len(pending) - done} 张。\n"
-                "被跳过的卡片仍可右键单独补齐，或手动编辑。",
-                "补齐完成",
-            )
+        self._start_completion(pending, force=False, batch=True)
 
     def _active_provider_id(self) -> str:
         try:

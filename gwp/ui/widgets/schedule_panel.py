@@ -250,9 +250,26 @@ class SchedulePanel(QFrame):
         filters.setSpacing(8)
         self.check_hide_done = QCheckBox("隐藏已完成")
         self.check_hide_done.setToolTip("只看还没做完的事情")
+        # **默认勾上**（需求："日程默认 隐藏已完成"）。
+        #
+        # 用户上一次的选择会被记住（``ui.schedule_hide_done``）——
+        # 默认值只在**从没设置过**时生效。这两件事要分开：
+        # "默认隐藏"是初始值，"用户改成显示"是他的选择，不该每次启动被掰回去。
+        try:
+            _hidden = self._config.get("ui.schedule_hide_done", True)
+        except Exception:  # noqa: BLE001 - 配置读不到就用默认
+            _hidden = True
+        self.check_hide_done.setChecked(bool(_hidden))
         filters.addWidget(self.check_hide_done)
         filters.addStretch(1)
         layout.addLayout(filters)
+
+        # 被"过了 DDL"藏起来的条目数量提示（平时隐藏）
+        self.lbl_expired = QLabel("")
+        self.lbl_expired.setObjectName("Muted")
+        self.lbl_expired.setWordWrap(True)
+        self.lbl_expired.setVisible(False)
+        layout.addWidget(self.lbl_expired)
 
         # ---- 列表 ----
         self.scroll = QScrollArea()
@@ -280,8 +297,24 @@ class SchedulePanel(QFrame):
         root.addWidget(self.expanded, 1)
 
         self._rows: list[QWidget] = []
-        self.check_hide_done.toggled.connect(lambda _checked: self._restyle_done())
+        #: 上一次 set_entries 收到的**全部**条目。
+        #: 勾选/取消「隐藏已完成」时要按它重画一遍 —— 只改可见性的话，
+        #: "过了 DDL 不显示"那条过滤不会被重新执行，状态会不一致。
+        self._all_entries: list[AgendaEntry] = []
+        self.check_hide_done.toggled.connect(self._on_hide_done_toggled)
         self.set_collapsed(False)
+
+    def _on_hide_done_toggled(self, checked: bool) -> None:
+        """记住这次选择，并按新规则重画列表。"""
+        try:
+            self._config.set("ui.schedule_hide_done", bool(checked))
+            self._config.save()
+        except Exception:  # noqa: BLE001 - 记不住偏好不该影响使用
+            log.debug("保存「隐藏已完成」偏好失败", exc_info=True)
+        if self._all_entries:
+            self.set_entries(self._all_entries)
+        else:
+            self._restyle_done()
 
     # ------------------------------------------------------------------
     # 折叠 / 展开（需求：只有这两态，宽度不可拖）
@@ -350,6 +383,7 @@ class SchedulePanel(QFrame):
 
     def set_entries(self, entries: list[AgendaEntry]) -> None:
         """用新数据重建整个列表。"""
+        self._all_entries = list(entries)
         for widget in self._rows:
             self.list_layout.removeWidget(widget)
             widget.setParent(None)
@@ -359,10 +393,54 @@ class SchedulePanel(QFrame):
         pending = [e for e in entries if not e.done]
         self.lbl_count.setText(f"（待办 {len(pending)} / 共 {len(entries)}）")
 
-        shown = [
+        # ---- 过滤：默认隐藏已完成 + **超过 DDL 的不再显示** ----
+        #
+        # 需求："日程默认 隐藏已完成  超过DDL后，日程栏不再显示"
+        #
+        # 两条规则合起来是一件事：**日程栏只留"还需要你动手"的东西**。
+        #
+        # * 已完成 -> 不用再管了；
+        # * 过了 DDL -> 也做不了什么了（交不了 / 已经晚了）。
+        #
+        # 为什么"过了 DDL"只过滤**未完成**的：
+        # 一条已经做完、DDL 也过了的记录，本来就该由"隐藏已完成"处理；
+        # 而**已完成的条目不该因为"过期"被算进下面的提示数字里** ——
+        # 那会让用户以为还有什么没处理。
+        #
+        # 另外：**没有 DDL 的条目永远显示**。"没期限"不代表"过期了"，
+        # 把它们一起藏掉就等于新建的日程凭空消失，那是个严重得多的 bug。
+        hide_done = self.check_hide_done.isChecked()
+        now = datetime.now()
+
+        def _kept(entry: AgendaEntry) -> bool:
+            if entry.done:
+                return not hide_done
+            moment = entry.due_at
+            if moment is not None and moment < now:
+                return False          # 过了 DDL 且未完成 -> 不再显示
+            return True
+
+        shown = [entry for entry in entries if _kept(entry)]
+
+        # 被"过期"藏起来的**未完成**条目单独数一下，给用户一个交代。
+        # 不声不响地让东西消失比藏起来更糟 —— 用户会以为记录丢了。
+        expired = [
             entry for entry in entries
-            if not (entry.done and self.check_hide_done.isChecked())
+            if not entry.done and not _kept(entry)
         ]
+        if expired:
+            self.lbl_expired.setText(
+                f"另有 {len(expired)} 项已过 DDL，不再显示"
+            )
+            self.lbl_expired.setToolTip(
+                "这些已经过了截止时间，日程栏不再列出：\n"
+                + "\n".join(f"· {e.title}（{e.due_label}）" for e in expired[:10])
+                + ("\n…" if len(expired) > 10 else "")
+            )
+            self.lbl_expired.setVisible(True)
+        else:
+            self.lbl_expired.setVisible(False)
+
         for entry in shown:
             row = self._build_row(entry)
             # 把 entry 挂在行上：折叠窄条要统计未完成数量，测试也用它。

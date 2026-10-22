@@ -68,7 +68,7 @@ EXCLUDES = [
     "pydoc",
     "doctest",
     "test",
-    # 论坛是用**系统浏览器**打开的（菜单「论坛 → 牢大CS」），
+    # 论坛是用**系统浏览器**打开的（菜单「论坛」里用户自己维护的网址列表），
     # 不需要内嵌 Chromium，所以可以排除掉这一大坨（省约 130MB）
     "PyQt6.QtWebEngineCore",
     "PyQt6.QtWebEngineWidgets",
@@ -118,8 +118,9 @@ DOC_FILES = (
     "Great_White_Planet_使用说明.md",
     "Great White Planet 简要说明书.pdf",
     "Great White Planet 安装步骤说明.pdf",
-    # 教学书（用本项目讲软件工程全流程）。体积较大但用户明确要求随包。
-    "开发实践——Great White Planet.pdf",
+    # 教学书（用本项目讲软件工程全流程）。
+    # 用户已明确不要这本书的 PDF，所以随包带 **Markdown** 版本。
+    "开发实践——Great White Planet.md",
 )
 for name in DOC_FILES:
     source = document / name
@@ -130,6 +131,22 @@ for name in DOC_FILES:
 
 # 从产物里剔除的文件（二进制/资源，Excludes 管不到）
 EXCLUDE_BINARIES = ("opengl32sw.dll",)
+
+# 版本资源（exe 的「属性 -> 详细信息」里显示的版本号）
+#
+# **从 gwp/__init__.py 读出版本号再生成**，而不是在这里写死 ——
+# 版本号只能有一个来源（见 installer/build_version_info.py 的说明）。
+_VERSRC = out = None
+try:
+    import sys as _sys
+
+    _sys.path.insert(0, str(CODE / "installer"))
+    from build_version_info import write_version_file as _write_ver
+
+    _VERSRC = str(_write_ver(CODE, Path(SPECPATH) / ".version_tmp"))
+    print(f"[版本信息] {_VERSRC}")
+except Exception as _exc:  # noqa: BLE001 - 生成失败不该让打包挂掉
+    print(f"[警告] 生成版本信息失败，exe 将没有版本号：{_exc}")
 
 icon = resources / "icons" / "planet.ico"
 
@@ -170,6 +187,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(icon) if icon.is_file() else None,
+    version=_VERSRC,
 )
 
 coll = COLLECT(

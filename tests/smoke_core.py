@@ -2234,16 +2234,48 @@ def main() -> int:
           any("外部.md" in "".join(a) for a, _r in _w_hits), str(_w_hits[:1]))
 
     # 再改一次仍然能发现
-    (_watch_dir / "科目" / "外部.md").write_text("又改了", encoding="utf-8")
+    #
+    # **为什么这里要显式推进 mtime**（这不是在掩盖 bug，测试必须这样做）：
+    #
+    # 快照存的是 ``{路径: mtime_ns}``，所以"能不能发现变化"完全取决于
+    # mtime 有没有变。而 Windows 对**极快连续的同文件重写**有时**不更新 mtime**
+    # —— 实测：先写 3 字节、紧接着写 27 字节（长度都变了），
+    # ``st_mtime_ns`` 仍然是上一毫秒的那个值。
+    #
+    # 也就是说：**文件内容变了，但快照看起来一模一样**，那一次改动就发现不了。
+    #
+    # 影响面（实测过）：
+    #
+    # * 两次写之间隔 50ms -> 正常发现；
+    # * 隔 1 秒（人手速）-> 正常发现；
+    # * **完全不等**（脚本/测试的紧循环）-> 可能漏。
+    #
+    # 真实使用中用户不可能在 1 毫秒内保存两次，所以这个边界不值得为它
+    # 付出"每次扫描都给所有文件算哈希"的代价（那会把空闲 CPU 从 0.5% 拉高）。
+    # 但**测试**必须显式区分时间戳，否则断言会偶发失败 —— 那样看起来像
+    # 防抖逻辑坏了，其实只是文件系统没给出可分辨的时间戳。
+    _md_file = _watch_dir / "科目" / "外部.md"
+    _before_mtime = _md_file.stat().st_mtime
+    _md_file.write_text("又改了", encoding="utf-8")
+    if _md_file.stat().st_mtime <= _before_mtime:
+        # 时间戳没推进 -> 明确改一下 mtime，模拟"过了一小会儿再改"
+        import os as _os
+
+        _stamp = _before_mtime + 1.0
+        _os.utime(_md_file, (_stamp, _stamp))
     _used2 = _drive_until_hit()
     check("**第二次改动同样被发现**",
-          _used2 > 0 and len(_w_hits) == 2, f"{_used2} 次, hits={len(_w_hits)}")
+          _used2 > 0 and len(_w_hits) == 2,
+          f"{_used2} 次, hits={len(_w_hits)}, "
+          f"pending={None if _w._pending is None else len(_w._pending)}")
 
     # 删掉文件 -> 出现在 removed 里
-    (_watch_dir / "科目" / "外部.md").unlink()
+    _md_file.unlink()
     _used3 = _drive_until_hit()
     check("**删除也会被发现**",
-          _used3 > 0 and len(_w_hits) == 3, f"{_used3} 次, hits={len(_w_hits)}")
+          _used3 > 0 and len(_w_hits) == 3,
+          f"{_used3} 次, hits={len(_w_hits)}, "
+          f"pending={None if _w._pending is None else len(_w._pending)}")
     check("删除出现在 removed 参数里",
           bool(_w_hits[-1][1]), str(_w_hits[-1]))
 
@@ -2855,6 +2887,225 @@ def main() -> int:
             os.environ["GWP_ALLOW_REAL_WRITE"] = _prev_allow
         else:
             os.environ.pop("GWP_ALLOW_REAL_WRITE", None)
+
+    # ------------------------------------------------ 单词卡：直连 API + 解析
+    #
+    # 需求（用户原话）："单词卡那里，你用API问AI，不要让用户自己问"
+    #
+    # 根因：`web_bridge.send_to_ai` 原来**只给带图片的请求**开了直连通道，
+    # 纯文本一律掉进"复制提示词 + 打开网页 + 让用户粘贴回答"那条兜底路。
+    # 于是单词卡补齐（纯文字）即使用户配好了 API Key 也还是被要求手动粘贴。
+    from gwp.data_manager import wordbook as _wb
+
+    # ---- ① 模型把 examples 当数组返回时不能写进乱码 ----
+    #
+    # 这是**实现过程中发现的真 bug**：提示词要求 examples 是"每行一句"的
+    # **字符串**，但模型经常返回数组；而原来的 `str(data.get("examples"))`
+    # 会把数组变成 `"[{'en': ...}]"` 这种人形乱码**直接写进用户的卡片文件**
+    # （实测：例句字段变成 141 个字符、以 `[` 开头的内容）。
+    check("**数组形状的例句会被拼成干净的行文本**",
+          _wb._as_text([{"en": "A.", "zh": "甲"}, {"en": "B.", "zh": "乙"}])
+          == "A. —— 甲\nB. —— 乙",
+          repr(_wb._as_text([{"en": "A.", "zh": "甲"}])))
+    check("字符串形状的例句原样保留",
+          _wb._as_text("A. —— 甲\nB. —— 乙") == "A. —— 甲\nB. —— 乙")
+    check("兼容 english/chinese 这样的键名",
+          _wb._as_text([{"english": "A.", "chinese": "甲"}]) == "A. —— 甲")
+    check("空值/空列表都变成空串",
+          _wb._as_text(None) == "" and _wb._as_text(["", "  "]) == "")
+    check("非字符串非列表的值也能兜住",
+          _wb._as_text(42) == "42", repr(_wb._as_text(42)))
+
+    _wc_reply = (
+        '{"english":"ubiquitous","phonetic":"/juːˈbɪkwɪtəs/",'
+        '"part_of_speech":"adj.","meaning":"无处不在的",'
+        '"examples":[{"en":"Smartphones are ubiquitous.","zh":"手机无处不在。"}],'
+        '"phrases":["ubiquitous computing —— 普适计算"],'
+        '"tip":"ubi 到处 + que 任何"}'
+    )
+    _wc_card, _wc_err = _wb.parse_completion(_wc_reply, "ubiquitous")
+    check("**解析数组形状的回答能拿到完整卡片**",
+          _wc_err == "" and _wc_card is not None
+          and _wc_card.part_of_speech == "adj."
+          and _wc_card.meaning == "无处不在的"
+          and _wc_card.completed,
+          f"err={_wc_err!r}")
+    check("**解析出来的例句不是乱码**",
+          "Smartphones are ubiquitous. —— 手机无处不在。"
+          == (_wc_card.examples or "").strip(),
+          repr(_wc_card.examples))
+    check("搭配也解析成行文本",
+          "普适计算" in (_wc_card.phrases or ""), repr(_wc_card.phrases))
+
+    # ---- ② 纯文本请求必须走**直连**，不能要求用户粘贴 ----
+    from gwp.ai.providers import web_bridge as _wbridge
+    from gwp.ui import common
+
+    class _ProbeConfig:
+        """假配置：像真实配置一样给出"当前启用哪个提供方"。
+
+        **必须给** —— 候选顺序就是从这里取的（``ai.active_provider``）。
+        我第一版让它一律返回 default（空串），结果候选列表为空、
+        `_call_direct` 直接返回空、测试断言失败 —— 那是**测试桩不像真实配置**，
+        不是功能问题。
+        """
+
+        def get(self, key, default=None):  # noqa: ANN001
+            if key == "ai.active_provider":
+                return "probe"
+            return default
+
+    class _DirectProbe:
+        """假的 AIManager：记录被调用，并返回一段文本。"""
+
+        def __init__(self):
+            self.calls = 0
+            self.active_id = "probe"
+
+        def get(self, provider_id):  # noqa: ANN001
+            return self
+
+        def is_configured(self):
+            return True, ""
+
+        def chat_with_fallback(self, messages, *a, **k):
+            self.calls += 1
+            return "直连回答", "probe"
+
+    class _ProbeCtx:
+        def __init__(self):
+            self.ai = _DirectProbe()
+            self.config = _ProbeConfig()
+
+    _pctx = _ProbeCtx()
+    _direct = _wbridge.send_to_ai("请回答", context=_pctx, parent=None)
+    check("**纯文本请求会直接调用 API（不再让用户粘贴）**",
+          _direct == "直连回答" and _pctx.ai.calls == 1,
+          f"reply={_direct!r} calls={_pctx.ai.calls}")
+
+    # 用户原话的核心：**不要弹粘贴框**
+    _paste_calls = {"n": 0}
+    _real_paste = common.ask_paste_reply
+    common.ask_paste_reply = lambda *a, **k: (
+        _paste_calls.__setitem__("n", _paste_calls["n"] + 1), ""
+    )[-1]
+    try:
+        _pctx.ai.calls = 0
+        _wbridge.send_to_ai("再问一次", context=_pctx, parent=None)
+    finally:
+        common.ask_paste_reply = _real_paste
+    check("**直连成功时不会弹出粘贴框**", _paste_calls["n"] == 0,
+          f"粘贴框被调用 {_paste_calls['n']} 次")
+
+    # ---- ③ 直连不可用时仍要退回"复制+粘贴"（不能把这条路堵死）----
+    #
+    # 注意这里要**把 has_gui 打桩成 True**。core 自检是**没有界面的**，
+    # 而"让用户粘贴"必须建对话框 —— 没有 QApplication 时 Qt 会直接中止进程，
+    # 所以 `send_to_ai` 会在无界面时主动跳过弹窗（见下面 ④ 的断言）。
+    # 想验证"有界面时会退回粘贴"，就得先假装有界面。
+    class _BadProbe:
+        def __init__(self):
+            self.active_id = ""
+
+        def get(self, provider_id):  # noqa: ANN001
+            return None
+
+        def is_configured(self):
+            return False, "未配置"
+
+        def chat_with_fallback(self, messages, *a, **k):
+            raise RuntimeError("不该被调用")
+
+    class _BadCtx:
+        def __init__(self):
+            self.ai = _BadProbe()
+            self.config = _ProbeConfig()
+
+    _real_has_gui = common.has_gui
+    _paste_calls["n"] = 0
+    common.has_gui = lambda: True
+    common.ask_paste_reply = lambda *a, **k: (
+        _paste_calls.__setitem__("n", _paste_calls["n"] + 1), "粘贴的回答"
+    )[-1]
+    try:
+        _fallback = _wbridge.send_to_ai("没法直连", context=_BadCtx(), parent=None)
+    finally:
+        common.ask_paste_reply = _real_paste
+        common.has_gui = _real_has_gui
+    check("**有界面且没有可用 AI 时，退回粘贴（这条路仍然留着）**",
+          _paste_calls["n"] == 1 and _fallback == "粘贴的回答",
+          f"粘贴框 {_paste_calls['n']} 次, reply={_fallback!r}")
+
+    # ---- ④ 无界面时**绝不能建控件**（这是让 core 自检当场崩溃的真 bug）----
+    #
+    # Qt 在没有 QApplication 时创建 QWidget 不会抛异常，而是
+    # **打印一行然后中止进程**（实测退出码 0xC0000409）。所以这里必须返回空串。
+    _paste_calls["n"] = 0
+    common.ask_paste_reply = lambda *a, **k: (
+        _paste_calls.__setitem__("n", _paste_calls["n"] + 1), "不该被调用"
+    )[-1]
+    try:
+        _nogui = _wbridge.send_to_ai("无界面", context=_BadCtx(), parent=None)
+    finally:
+        common.ask_paste_reply = _real_paste
+    check("**没有界面时不建任何控件、直接返回空（否则 Qt 会中止进程）**",
+          _nogui == "" and _paste_calls["n"] == 0,
+          f"reply={_nogui!r} 粘贴框={_paste_calls['n']}")
+
+    from PyQt6.QtWidgets import QApplication as _QApp
+
+    _app_inst = _QApp.instance()
+    check("**has_gui() 与「有没有真正的 QApplication」一致**",
+          common.has_gui() == isinstance(_app_inst, _QApp),
+          f"instance={type(_app_inst).__name__ if _app_inst is not None else None} "
+          f"has_gui={common.has_gui()}")
+
+    # ---- allow_paste=False：后台线程使用的严格模式 ----
+    #
+    # 单词卡补齐现在跑在后台线程里，必须保证它**绝不**去碰剪贴板、
+    # 开浏览器、弹粘贴框（Qt 不允许在非 GUI 线程建控件；批量时还会开 N 个窗口）。
+    _strict = {"clipboard": 0, "browser": 0, "paste": 0}
+    _real_copy = _wbridge.copy_to_clipboard
+    import webbrowser as _webbrowser
+
+    _real_open = _webbrowser.open
+    _real_has_gui2 = common.has_gui
+    _wbridge.copy_to_clipboard = lambda *a, **k: (
+        _strict.__setitem__("clipboard", _strict["clipboard"] + 1), True
+    )[-1]
+    _webbrowser.open = lambda *a, **k: (
+        _strict.__setitem__("browser", _strict["browser"] + 1), True
+    )[-1]
+    common.ask_paste_reply = lambda *a, **k: (
+        _strict.__setitem__("paste", _strict["paste"] + 1), "不该被调用"
+    )[-1]
+    # 假装"有界面"，专门验证 allow_paste 这道闸门本身
+    common.has_gui = lambda: True
+    try:
+        _strict_reply = _wbridge.send_to_ai(
+            "后台任务", context=_BadCtx(), parent=None, allow_paste=False
+        )
+    finally:
+        _wbridge.copy_to_clipboard = _real_copy
+        _webbrowser.open = _real_open
+        common.has_gui = _real_has_gui2
+        common.ask_paste_reply = _real_paste
+    check("**allow_paste=False 时完全不碰剪贴板/浏览器/粘贴框**",
+          _strict_reply == ""
+          and _strict["clipboard"] == 0
+          and _strict["browser"] == 0
+          and _strict["paste"] == 0,
+          f"reply={_strict_reply!r} 计数={_strict}")
+
+    # ---- has_direct_provider：界面层据此决定"后台跑"还是"手工粘贴" ----
+    check("**配好 API 时 has_direct_provider 为真**",
+          _wbridge.has_direct_provider(_ProbeCtx()) is True,
+          str(_wbridge.has_direct_provider(_ProbeCtx())))
+    check("**没配 API 时 has_direct_provider 为假**",
+          _wbridge.has_direct_provider(_BadCtx()) is False,
+          str(_wbridge.has_direct_provider(_BadCtx())))
+    check("没有 context 时安全返回假（不抛异常）",
+          _wbridge.has_direct_provider(None) is False)
 
     # ------------------------------------------------ VSCode 打开（真实 bug 回归）
     #

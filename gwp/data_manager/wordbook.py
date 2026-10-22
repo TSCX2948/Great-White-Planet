@@ -58,6 +58,53 @@ def card_path(folder: Path, english: str) -> Path:
 # 卡片模型
 # --------------------------------------------------------------------------
 
+def _as_text(value) -> str:
+    """把模型给的字段统一成字符串。
+
+    为什么需要它（**真实 bug**）：提示词要求 ``examples`` / ``phrases`` 是
+    "每行一句"的**字符串**，但模型经常当成数组返回::
+
+        "examples": [{"en": "Smartphones are ubiquitous.", "zh": "手机无处不在。"}]
+
+    而这里原来是 ``str(data.get("examples") or "")`` —— 对列表调用 ``str()``
+    会得到 ``"[{'en': 'Smartphones...'}]"`` 这种人形乱码，**直接写进用户的卡片文件**。
+    （实测：卡片例句变成 141 个字符、以 ``[`` ``{`` 开头的内容。）
+
+    所以按形状分别处理：
+
+    * ``str`` -> 原样（去首尾空白）；
+    * ``list`` -> 逐项转一行：
+      - 字典按 ``en``/``zh``（或 ``english``/``chinese``）拼成
+        ``英文 —— 中文``，正好是提示词要求的行格式；
+      - 字符串直接成行；
+    * 其它（数字等）-> 字符串化。
+
+    这么多容错是有意的：**模型不听 schema 是常态，但用户的卡片文件必须是干净的。**
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        lines: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                en = str(item.get("en") or item.get("english")
+                         or item.get("sentence") or "").strip()
+                zh = str(item.get("zh") or item.get("chinese")
+                         or item.get("translation") or item.get("cn") or "").strip()
+                if en and zh:
+                    lines.append(f"{en} —— {zh}")
+                elif en or zh:
+                    lines.append(en or zh)
+            else:
+                text = str(item).strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines)
+    return str(value).strip()
+
+
 @dataclass
 class WordCard:
     """一张单词卡。
@@ -108,21 +155,25 @@ class WordCard:
 
     @classmethod
     def from_dict(cls, data: dict, path: Path | None = None) -> "WordCard":
-        """从 json 数据建卡片。**缺字段一律用默认值**（用户会手改文件）。"""
+        """从 json 数据建卡片。**缺字段一律用默认值**（用户会手改文件）。
+
+        各个文本字段都过一遍 :func:`_as_text` —— 模型偶尔会把
+        ``examples`` / ``phrases`` 当数组返回，直接用 ``str()`` 会写进乱码。
+        """
         english = str(data.get("english") or "").strip()
         if not english and path is not None:
             english = path.stem                 # 兜底：拿文件名当词条
         card = cls(
             english=english,
-            phonetic=str(data.get("phonetic") or ""),
-            part_of_speech=str(data.get("part_of_speech") or ""),
-            meaning=str(data.get("meaning") or ""),
-            examples=str(data.get("examples") or ""),
-            phrases=str(data.get("phrases") or ""),
-            tip=str(data.get("tip") or ""),
-            note=str(data.get("note") or ""),
-            created_at=str(data.get("created_at") or ""),
-            updated_at=str(data.get("updated_at") or ""),
+            phonetic=_as_text(data.get("phonetic")),
+            part_of_speech=_as_text(data.get("part_of_speech")),
+            meaning=_as_text(data.get("meaning")),
+            examples=_as_text(data.get("examples")),
+            phrases=_as_text(data.get("phrases")),
+            tip=_as_text(data.get("tip")),
+            note=_as_text(data.get("note")),
+            created_at=_as_text(data.get("created_at")),
+            updated_at=_as_text(data.get("updated_at")),
             completed=bool(data.get("completed")),
             locked=bool(data.get("locked")),
         )

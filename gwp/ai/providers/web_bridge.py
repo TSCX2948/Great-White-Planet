@@ -201,6 +201,7 @@ def send_to_ai(
     parent=None,
     title: str = "网页版 AI",
     open_browser: bool = True,
+    allow_paste: bool = True,
 ) -> str:
     """把一段提示词（可选带一张图片）送进 AI，返回回答。
 
@@ -213,35 +214,66 @@ def send_to_ai(
 
     这样"以后填了视觉模型密钥"时，同一段界面代码自动变成全自动，
     不用改任何界面 —— 这是把"能力判断"收在一个函数里的好处。
+
+    ``allow_paste=False`` 时**绝不走网页版桥接**（不复制剪贴板、不开浏览器、
+    不弹粘贴框），直连拿不到就返回空串。
+
+    为什么需要这个开关：这个函数现在会被**后台线程**调用（见
+    ``ui/views/wordbook_view.py`` 的补齐任务）。而"让用户粘贴"要建
+    QMessageBox —— **在非 GUI 线程里建控件是不允许的**，Qt 会直接中止进程。
+    批量补齐时更糟：N 张卡会开 N 个浏览器窗口、弹 N 个框。
+    所以后台任务一律传 ``allow_paste=False``；需要手工粘贴的场景
+    （单张、用户主动触发）仍留在 GUI 线程里跑。
     """
     text = (prompt or "").strip()
     if not text and image_path is None:
         return ""
-    # ---- ① 优先：能直接看图的提供方（全自动，零粘贴）----
-    if image_path is not None and context is not None:
+    # ---- ① 优先：**直接调用 API**（全自动，零粘贴）----
+    #
+    # 需求（用户原话）："单词卡那里，你用API问AI，不要让用户自己问"
+    #
+    # 这里原来**只给带图片的请求**开了直连通道，纯文本一律掉进下面的
+    # "网页版桥接" ② —— 于是单词卡补齐、日记合并这类**纯文字**任务，
+    # 即使用户已经配好了 API Key，也还是被要求自己去网页问一遍再粘回来。
+    # 那显然不对：能直连就直连。
+    #
+    # 现在的判据：
+    #
+    # * **带图片** -> 只有"声明支持视觉 + 用户允许发图"的提供方才直连
+    #   （发图有隐私含义，必须显式开启，见 _provider_sees_images）；
+    # * **纯文本** -> 任何**已配置好**的提供方都可以直连 ——
+    #   文本没有额外隐私含义，而且用户既然填了 Key 就是想让软件去问。
+    #
+    # 直连失败（没有可用提供方、网络出错等）才退回 ②，
+    # 这样"没配 AI"的用户仍然有手工这条路可走。
+    if context is not None:
         try:
-            from gwp.ai.types import ChatMessage
-
-            manager = getattr(context, "ai", None)
-            if manager is not None:
-                for candidate_id in _vision_candidates(context, provider_id):
-                    provider = manager.get(candidate_id)      # AIManager 的取用接口
-                    if provider is None:
-                        continue
-                    if not _provider_sees_images(context, candidate_id, provider):
-                        continue
-                    reply, _used = manager.chat_with_fallback(
-                        [ChatMessage(role="user", content=text,
-                                     images=[str(image_path)])],
-                    )
-                    if reply and str(reply).strip():
-                        log.info("图片已由 %s 直接识别（无需手工粘贴）", candidate_id)
-                        return str(reply).strip()
+            reply = _call_direct(
+                context, text,
+                provider_id=provider_id,
+                image_path=image_path,
+            )
         except Exception:  # noqa: BLE001 - 直连失败就退回桥接
-            log.warning("直连视觉模型失败，退回网页版桥接", exc_info=True)
+            log.warning("直连 AI 失败，退回网页版桥接", exc_info=True)
+            reply = ""
+        if reply:
+            return reply
 
     # ---- ② 兜底：网页版桥接（剪贴板 + 用户粘贴）----
     from gwp.ui import common
+
+    log.debug("走网页版桥接：text=%r has_image=%s", text[:40], image_path is not None)
+    if not allow_paste:
+        # 调用方明确要求"不许手工粘贴"（后台线程、批量任务）。
+        # 直连都没拿到回答，这里只能返回空串，由调用方按失败处理。
+        log.warning("直连失败且调用方禁止手工粘贴，本次跳过：%r", text[:40])
+        return ""
+    if not common.has_gui():
+        # 没有真正的 QApplication：**绝不能建任何控件**（Qt 会直接中止进程）。
+        # 这种情况只会出现在无界面的调用里（脚本、自检），
+        # 那时"让用户粘贴"本来也无从谈起，返回空串让调用方按失败处理。
+        log.warning("没有界面可用，无法让用户粘贴 AI 回答（已跳过）")
+        return ""
 
     image_copied = False
     if image_path is not None:
@@ -273,6 +305,101 @@ def send_to_ai(
     return common.ask_paste_reply(
         parent, title=title, prompt=text, hint=hint,
     )
+
+
+def _call_direct(
+    context,
+    text: str,
+    *,
+    provider_id: str = "",
+    image_path=None,
+) -> str:
+    """直接调用 API 拿回答；拿不到就返回空串（由调用方决定要不要兜底）。
+
+    **不抛异常之外的判断**：没有可用提供方、或提供方没配好，都返回空串。
+    这样调用方的逻辑很简单："有回答就用，没有就走桥接"。
+    """
+    from gwp.ai.types import ChatMessage
+
+    manager = getattr(context, "ai", None)
+    if manager is None:
+        return ""
+
+    # 带图片时先确认"这个提供方真的能看图 + 用户允许发图"；
+    # 纯文本则只需要"提供方已配置好"。
+    for candidate_id in _direct_candidates(context, provider_id):
+        if image_path is not None:
+            provider = manager.get(candidate_id)
+            if provider is None:
+                continue
+            if not _provider_sees_images(context, candidate_id, provider):
+                continue
+        elif not _provider_ready(context, candidate_id):
+            continue
+
+        message = ChatMessage(role="user", content=text)
+        if image_path is not None:
+            message = ChatMessage(role="user", content=text,
+                                  images=[str(image_path)])
+        try:
+            reply, used = manager.chat_with_fallback([message])
+        except Exception:  # noqa: BLE001 - 换下一个候选
+            log.debug("直连 %s 失败，尝试下一个", candidate_id, exc_info=True)
+            continue
+        reply = str(reply or "").strip()
+        if reply:
+            log.info("已直接调用 API（%s）拿到回答，无需用户手工粘贴", used)
+            return reply
+    return ""
+
+
+def _direct_candidates(context, provider_id: str) -> list[str]:
+    """按优先级列出"可以直接调用"的提供方 id。
+
+    顺序：调用方指定的 -> 当前启用的 -> 兜底链。
+    与 :func:`_vision_candidates` 同一套顺序，只是这里**纯文本也能用**。
+    """
+    return _vision_candidates(context, provider_id)
+
+
+def _provider_ready(context, provider_id: str) -> bool:
+    """这个提供方现在能不能直接调用（纯文本）。
+
+    判据只有一条：**它能自己说自己配好了**（``is_configured()`` 返回 True）。
+    不额外要求"用户显式允许" —— 文本请求没有发图那种隐私含义，
+    而且用户既然在设置里填了 API Key，本来就期望软件自己去问。
+    """
+    try:
+        manager = getattr(context, "ai", None)
+        provider = manager.get(provider_id) if manager is not None else None
+        if provider is None:
+            return False
+        ok, _reason = provider.is_configured()
+        return bool(ok)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def has_direct_provider(context, provider_id: str = "") -> bool:
+    """现在有没有能**直接调用**的 AI（不用手工粘贴）。
+
+    界面层用它来分工：
+
+    * 有 -> 可以让**后台线程**去补齐（``allow_paste=False``）；
+    * 没有 -> 只能留在 GUI 线程走"复制提示词 + 粘贴回答"。
+
+    这个判断**不发起任何网络请求**，只问各提供方 ``is_configured()``，
+    所以可以随手调用。
+    """
+    if context is None:
+        return False
+    try:
+        for candidate_id in _direct_candidates(context, provider_id):
+            if _provider_ready(context, candidate_id):
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 
 
 def _vision_candidates(context, provider_id: str) -> list[str]:

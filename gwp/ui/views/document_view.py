@@ -202,12 +202,16 @@ class DocumentView(QWidget):
                 self.chat.resend_file(force=False)
 
     def _on_fallback(self, from_provider: str = "", to_provider: str = "", to_label: str = "", reason: str = "", **_kwargs) -> None:
-        if self.chat.isVisible():
-            common.warn(
-                self,
-                f"主 AI 不可用，已自动切换到「{to_label or to_provider}」继续。\n\n原因：{reason}",
-                "已切换到兜底 AI",
-            )
+        # 可能从后台线程发来（AIWorker）—— 弹窗必须在 GUI 线程里建。
+        def _apply() -> None:
+            if self.chat.isVisible():
+                common.warn(
+                    self,
+                    f"主 AI 不可用，已自动切换到「{to_label or to_provider}」继续。\n\n原因：{reason}",
+                    "已切换到兜底 AI",
+                )
+
+        common.run_in_gui(self, _apply)
 
     # ==================================================================
 

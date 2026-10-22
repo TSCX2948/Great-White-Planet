@@ -2201,13 +2201,19 @@ def main() -> int:
 
     captured_default: list = []
 
-    # 从源码里取回未被桩替换的 confirm，单独编译执行
-    _start = _module_source.find("def confirm(")
-    _end = _module_source.find("\ndef ask_text(")
-    _namespace: dict = {}
+    # 从源码里取回**未被桩替换**的 confirm。
+    #
+    # 做法：把整个 common 模块源码在它自己的命名空间里执行，
+    # 再从那里取 confirm。
+    #
+    # 为什么不再"只切出 confirm 那段源码 + 手工塞两个名字"（原来是这么写的）：
+    # confirm 一旦新增依赖（例如 has_gui / log），那种切法就会
+    # `NameError: name 'has_gui' is not defined` —— 报错看着像功能坏了，
+    # 其实只是探针缺少依赖。跑整个模块就自然拿到全部导入与依赖。
+    _namespace: dict = {"__name__": "gwp.ui.common_probe"}
     exec(  # noqa: S102 - 测试内自用，源码来自本仓库
-        compile(_module_source[_start:_end], "confirm_probe", "exec"),
-        {"QMessageBox": _QMessageBox, "QWidget": object},
+        compile(_module_source, "confirm_probe", "exec"),
+        _namespace,
         _namespace,
     )
     real_confirm = _namespace["confirm"]
@@ -3519,7 +3525,7 @@ def main() -> int:
         check("其它日程有「编辑」「删除」按钮",
               "编辑" in sched_buttons and "删除" in sched_buttons, str(sched_buttons))
 
-    # 点「完成」：写回 homework.json 并重新排序
+    # 点「完成」：写回 homework.json
     if hw_row is not None:
         done_btn = next(
             b for b in hw_row.findChildren(QPushButton) if b.text() == "完成"
@@ -3531,12 +3537,30 @@ def main() -> int:
         check("点「完成」写回了 homework.json",
               stored is not None and stored.done is True,
               str(stored.done if stored else "无"))
+
+        # **默认「隐藏已完成」**（需求："日程默认 隐藏已完成"，v2.1 新增默认）。
+        # 所以标完之后它应当**从列表里消失** —— 这是新行为，不是 bug。
+        check("**标完成后默认就从日程栏消失（隐藏已完成）**",
+              "日程作业甲" not in _row_titles(), str(_row_titles()))
+
+        # 取消勾选后，已完成的应当回来：排在未完成之后，并且划线
+        panel.check_hide_done.setChecked(False)
+        for _ in range(6):
+            app.processEvents()
         moved = _row_titles()
+        check("取消「隐藏已完成」后已完成的条目重新出现",
+              "日程作业甲" in moved, str(moved))
         check("完成后的作业排到未完成之后",
               moved.index("日程作业甲") > moved.index("日程作业乙"), str(moved))
+        _done_row = _row_of("日程作业甲")
         check("已完成的条目划线",
-              _row_of("日程作业甲").findChild(_QLabel, "AgendaText").font().strikeOut(),
+              _done_row is not None
+              and _done_row.findChild(_QLabel, "AgendaText").font().strikeOut(),
               "应划线")
+        # 回到默认（隐藏），后面的用例按默认状态走
+        panel.check_hide_done.setChecked(True)
+        for _ in range(6):
+            app.processEvents()
 
     # 点「完成」（其它日程）
     if sched_row is not None:
@@ -3549,12 +3573,32 @@ def main() -> int:
         check("点「完成」把其它日程标为完成",
               context.schedule.get(schedule_item.id).done is True)
 
-    # 隐藏已完成
+    # ---- 日程栏的两个新规则（v2.1）----
+    #
+    # 需求："日程默认 隐藏已完成  超过DDL后，日程栏不再显示"
+    check("**「隐藏已完成」默认就是勾上的**",
+          panel.check_hide_done.isChecked(), "默认没勾上")
+    # 注意：`_ForumConfig` 是后面「论坛」那一节才导入的名字，Python 会把
+    # 整个函数体里出现过的名字都当**局部变量**，所以在它之前用会报
+    # UnboundLocalError（我踩了一次）。这里就地再导入一个最省事。
+    from gwp.core.config import Config as _FreshConfig
+
+    _fresh_cfg = _FreshConfig.load(
+        Path(tempfile.mkdtemp(prefix="gwp_schedcfg_")) / "config.json", force=True
+    )
+    check("**配置里的默认值也是隐藏（新用户开箱即隐藏）**",
+          bool(_fresh_cfg.get("ui.schedule_hide_done", True)) is True,
+          str(_fresh_cfg.get("ui.schedule_hide_done")))
+    check("**用户取消勾选后会被记住（不是每次启动掰回去）**",
+          context.config.get("ui.schedule_hide_done") is not None,
+          str(context.config.get("ui.schedule_hide_done")))
+
+    # 隐藏已完成（v2.1 起**默认就是勾上的**）
     panel.check_hide_done.setChecked(True)
     for _ in range(6):
         app.processEvents()
     visible_titles = [_row_title(row) for row in panel._rows if row.isVisible()]
-    check("勾选「隐藏已完成」后不再显示已完成的条目",
+    check("**勾选「隐藏已完成」后不再显示已完成的条目**",
           "日程作业甲" not in visible_titles and "其它日程丙" not in visible_titles,
           str(visible_titles))
     check("未完成的条目仍然显示",
@@ -3562,6 +3606,40 @@ def main() -> int:
     panel.check_hide_done.setChecked(False)
     for _ in range(6):
         app.processEvents()
+    check("取消勾选后已完成的条目又回来了",
+          {"日程作业甲", "其它日程丙"} <= set(_row_titles()),
+          str(_row_titles()))
+
+    # ---- 超过 DDL 的条目不再显示（需求："超过DDL后，日程栏不再显示"）----
+    #
+    # 规则：**未完成 + 已过 DDL -> 不显示**。
+    # 已完成的过期条目由「隐藏已完成」负责；没有 DDL 的**永远显示**
+    # （"没期限"不等于"过期了"，把它们一起藏掉等于新建的日程凭空消失）。
+    panel.check_hide_done.setChecked(True)
+    for _ in range(4):
+        app.processEvents()
+    _expired_due = (_dt2.now() - _td2(days=2)).strftime("%Y-%m-%dT%H:%M")
+    _hw4.create(sched_book.path / "homework" / "已过期作业丁",
+                content="x", due=_expired_due)
+    _no_due = _hw4.create(sched_book.path / "homework" / "没期限作业",
+                          content="x")
+    home.refresh_schedule()
+    for _ in range(8):
+        app.processEvents()
+    _titles_now = _row_titles()
+    check("**未完成但已过 DDL 的作业不再显示**",
+          "已过期作业丁" not in _titles_now, str(_titles_now))
+    check("**没有 DDL 的条目照常显示**（没期限不等于过期）",
+          "没期限作业" in _titles_now, str(_titles_now))
+    check("**过期项会被数出来并提示，不会悄悄消失**",
+          panel.lbl_expired.isVisible() and "已过 DDL" in panel.lbl_expired.text(),
+          f"可见={panel.lbl_expired.isVisible()} 文本={panel.lbl_expired.text()!r}")
+    check("过期提示里带了条目名（悬浮能看到是哪些）",
+          "已过期作业丁" in panel.lbl_expired.toolTip(),
+          panel.lbl_expired.toolTip()[:80])
+    # 把那条过期作业标成完成，避免它继续影响后面的用例
+    # （测试跑在一次性沙箱里，不需要真删文件）
+    _hw4.set_done(sched_book.path / "homework" / "已过期作业丁", True)
 
     # 新建日程：打桩对话框，确认落盘并出现在栏里
     from gwp.ui.views import home_view as _home_mod
@@ -3753,47 +3831,195 @@ def main() -> int:
     app.processEvents()
     check("打开后信息条又显示出来", clock.isVisible())
 
-    # ---- 论坛：菜单 → 用系统浏览器打开 ----
+    # ================= 论坛：用户自己维护的列表 =================
+    #
+    # 需求："论坛添加新增/删除论坛功能，需要用户提供论坛名称 网址"
+    #
+    # 原来菜单里只有一条硬编码的「牢大CS」（网址从 forum.laoda_cs_url 读）。
+    # 现在改成列表，用户自己增删改。所以这一节既测列表本身，
+    # 也测"老配置会不会搬进来"和"删光了会不会复活"（后者是踩过的真 bug）。
+    from gwp.data_manager import forum_store as _fs
+    from gwp.core.config import Config as _ForumConfig
+
+    # ---- 老配置搬家：只有 laoda_cs_url 时自动变成列表第一条 ----
+    _legacy_cfg = _ForumConfig.load(
+        Path(tempfile.mkdtemp(prefix="gwp_forum_")) / "config.json", force=True
+    )
+    _legacy_cfg.set("forum.laoda_cs_url", "https://cs9.x-way.work/")
+    _legacy_cfg.save()
+    _legacy = _fs.load(_legacy_cfg)
+    check("**老的单条论坛配置会自动搬进列表**",
+          len(_legacy) == 1 and _legacy[0].name == _fs.LEGACY_NAME
+          and _legacy[0].url == "https://cs9.x-way.work/",
+          str([(f.name, f.url) for f in _legacy]))
+
+    # ---- 网址规范化与校验 ----
+    check("**网址会自动补 https://**",
+          _fs.normalize_url("cs9.x-way.work") == "https://cs9.x-way.work",
+          _fs.normalize_url("cs9.x-way.work"))
+    check("已带协议的网址不动",
+          _fs.normalize_url("http://a.com") == "http://a.com")
+    check("**缺少点的域名会被拦下**",
+          "缺少点" in _fs.validate_url("abc"), _fs.validate_url("abc"))
+    check("**非 http/https 会被拦下**",
+          "http" in _fs.validate_url("ftp://x.com"), _fs.validate_url("ftp://x.com"))
+    check("空网址会被拦下", bool(_fs.validate_url("")))
+    check("正常网址通过校验", _fs.validate_url("bbs.example.edu") == "")
+
+    # ---- 名称校验 ----
+    check("空名称会被拦下", bool(_fs.validate_name("")))
+    check("**重名会被拦下**",
+          "已经有一个" in _fs.validate_name("牢大CS", taken=["牢大CS"]),
+          _fs.validate_name("牢大CS", taken=["牢大CS"]))
+    check("超长名称会被拦下",
+          bool(_fs.validate_name("x" * (_fs.MAX_NAME_LEN + 1))))
+    check("正常名称通过校验", _fs.validate_name("学习论坛") == "")
+
+    # ---- 增 / 改 / 删 / 调序 ----
+    _fs.add(_legacy_cfg, "学习论坛", "bbs.example.edu")
+    _fs.add(_legacy_cfg, "另一个", "https://x.org/forum")
+    _names = [f.name for f in _fs.load(_legacy_cfg)]
+    check("**能新增论坛（名称 + 网址）**",
+          _names == [_fs.LEGACY_NAME, "学习论坛", "另一个"], str(_names))
+    check("新增时网址被补全",
+          _fs.load(_legacy_cfg)[1].url == "https://bbs.example.edu",
+          _fs.load(_legacy_cfg)[1].url)
+
+    _fs.rename(_legacy_cfg, "另一个", "改过名", "y.org")
+    _after_rename = _fs.load(_legacy_cfg)
+    check("**能改名称与网址**",
+          _after_rename[2].name == "改过名"
+          and _after_rename[2].url == "https://y.org",
+          str([(f.name, f.url) for f in _after_rename]))
+    check("改名不会打乱顺序",
+          [f.name for f in _after_rename][:2] == [_fs.LEGACY_NAME, "学习论坛"],
+          str([f.name for f in _after_rename]))
+
+    _fs.move(_legacy_cfg, "学习论坛", -1)
+    check("**能调整顺序（上移）**",
+          [f.name for f in _fs.load(_legacy_cfg)][0] == "学习论坛",
+          str([f.name for f in _fs.load(_legacy_cfg)]))
+
+    _fs.remove(_legacy_cfg, "学习论坛")
+    check("**能删除论坛**",
+          "学习论坛" not in [f.name for f in _fs.load(_legacy_cfg)],
+          str([f.name for f in _fs.load(_legacy_cfg)]))
+
+    # ---- 删光之后**不许复活**（实现时踩到的真 bug）----
+    #
+    # 第一版 `load` 写成"列表为空就搬老配置"，于是用户删光之后
+    # 下次打开菜单会看到「牢大CS」自己回来了。判据必须区分
+    # "键不存在"（该搬家）和"键是空列表"（用户删光了，就该是空的）。
+    for _f in list(_fs.load(_legacy_cfg)):
+        _fs.remove(_legacy_cfg, _f.name)
+    check("能删到空", _fs.load(_legacy_cfg) == [], str(_fs.load(_legacy_cfg)))
+    _revived = [len(_fs.load(_legacy_cfg)) for _ in range(5)]
+    check("**删光之后不会自己复活（连读 5 次都是空的）**",
+          all(n == 0 for n in _revived), str(_revived))
+    _reopened = _ForumConfig.load(_legacy_cfg.path, force=True)
+    check("**重启软件后仍然是空的**",
+          _fs.load(_reopened) == [], str(_fs.load(_reopened)))
+
+    _fs.add(_reopened, "加回来", "back.com")
+    check("空列表之后还能再加",
+          [f.name for f in _fs.load(_reopened)] == ["加回来"],
+          str([f.name for f in _fs.load(_reopened)]))
+
+    # ---- 界面：菜单能列出、点了能开、删除要确认 ----
     forum_menu = next(
         (a.menu() for a in window.menuBar().actions() if "论坛" in a.text()), None
     )
     check("菜单栏有「论坛」", forum_menu is not None,
           str([a.text() for a in window.menuBar().actions()]))
-    entries = [a.text() for a in forum_menu.actions() if not a.isSeparator()] if forum_menu else []
-    check("论坛菜单下有「牢大CS」", any("牢大CS" in text for text in entries), str(entries))
 
-    laoda = next((a for a in forum_menu.actions() if "牢大CS" in a.text()), None) if forum_menu else None
-    check("「牢大CS」是可点击的菜单项", laoda is not None)
-    check("论坛地址来自配置（不写死在代码里）",
-          window.forum_url("laoda_cs").startswith("https://cs9.x-way.work"),
-          window.forum_url("laoda_cs"))
-
-    # 点一下：应调用 shell_ops.open_url（打桩，不真的开浏览器）
-    from gwp.services import shell_ops as _shell_forum
-
-    opened_urls: list = []
-    _real_open_url = _shell_forum.open_url
-    _shell_forum.open_url = lambda url: (opened_urls.append(url), True)[1]
+    _saved_forum_list = context.config.get("forum.list")
     try:
-        if laoda is not None:
-            laoda.trigger()
+        context.config.set("forum.list", [
+            {"name": "测试论坛甲", "url": "https://jia.example.edu"},
+            {"name": "测试论坛乙", "url": "https://yi.example.edu"},
+        ])
+        window._rebuild_forum_menu()
+        _menu_texts = [a.text() for a in window.menu_forum.actions()]
+        check("**「论坛」菜单里列出了两个论坛**",
+              "测试论坛甲" in _menu_texts and "测试论坛乙" in _menu_texts,
+              str(_menu_texts))
+        check("菜单里有「新增论坛…」入口",
+              any("新增论坛" in t for t in _menu_texts), str(_menu_texts))
+        check("菜单里有「编辑 / 删除」子菜单",
+              any("编辑 / 删除" in t for t in _menu_texts), str(_menu_texts))
+
+        # 点一下应当交给系统浏览器（打桩，不真的开浏览器）
+        from gwp.services import shell_ops as _shell_forum
+
+        opened_urls: list = []
+        _real_open_url = _shell_forum.open_url
+        _shell_forum.open_url = lambda url: (opened_urls.append(url), True)[1]
+        try:
+            _item = next(a for a in window.menu_forum.actions()
+                         if a.text() == "测试论坛乙")
+            _item.trigger()
             app.processEvents()
-    finally:
-        _shell_forum.open_url = _real_open_url
-    check("点「牢大CS」会用浏览器打开论坛地址",
-          opened_urls == ["https://cs9.x-way.work/"], str(opened_urls))
+        finally:
+            _shell_forum.open_url = _real_open_url
+        check("**点菜单里的论坛会用浏览器打开它的网址**",
+              opened_urls == ["https://yi.example.edu"], str(opened_urls))
 
-    # 打不开时要给出提示而不是静默失败
-    _shell_forum.open_url = lambda url: False
-    warned: list = []
-    _real_warn = _common3.warn
-    _common3.warn = lambda *a, **k: warned.append(a)
-    try:
-        window.open_forum("牢大CS")
+        # 删除：确认框说「否」时必须什么都不做
+        warned: list = []
+        _real_warn = _common3.warn
+        _real_confirm = _common3.confirm
+        _common3.warn = lambda *a, **k: warned.append(a)
+        _common3.confirm = lambda *a, **k: False
+        try:
+            _before_delete = _fs.load(context.config)
+            window.delete_forum(_before_delete[0])
+            check("**删除时点「取消」不会删掉**",
+                  _fs.load(context.config) == _before_delete,
+                  str([f.name for f in _fs.load(context.config)]))
+
+            # 确认删除
+            _common3.confirm = lambda *a, **k: True
+            window.delete_forum(_fs.load(context.config)[0])
+        finally:
+            _common3.warn = _real_warn
+            _common3.confirm = _real_confirm
+        _left = [f.name for f in _fs.load(context.config)]
+        check("**确认后真的删掉了**", _left == ["测试论坛乙"], str(_left))
+        _menu_after = [a.text() for a in window.menu_forum.actions()]
+        check("**菜单立刻反映删除（不用重启）**",
+              "测试论坛甲" not in _menu_after, str(_menu_after))
+
+        # 浏览器打不开时要给出提示而不是静默失败
+        _shell_forum.open_url = lambda url: False
+        warned.clear()
+        _common3.warn = lambda *a, **k: warned.append(a)
+        try:
+            window.open_forum("测试论坛乙", "https://yi.example.edu")
+        finally:
+            _shell_forum.open_url = _real_open_url
+            _common3.warn = _real_warn
+        check("浏览器打不开时会提示用户", bool(warned), str(warned)[:80])
     finally:
-        _shell_forum.open_url = _real_open_url
-        _common3.warn = _real_warn
-    check("浏览器打不开时会提示用户", bool(warned), str(warned)[:80])
+        if _saved_forum_list is None:
+            context.config.set("forum.list", None)
+        else:
+            context.config.set("forum.list", _saved_forum_list)
+        window._rebuild_forum_menu()
+
+    # ---- 版本号（v2.1 定稿）----
+    from gwp import __version__ as _gwp_version
+    from gwp.ui import help_content
+
+    check("**版本号已定稿为 v2.1.0**", _gwp_version == "2.1.0", _gwp_version)
+    _changelog = help_content.help_documents().get("更新记录", "")
+    check("更新记录里有 v2.1.0 一节",
+          "## v2.1.0" in _changelog, _changelog[:80])
+    check("**更新记录的 v2.1.0 段里写到了论坛功能**",
+          "论坛" in _changelog.split("## v1.0.0")[0],
+          "v2.1.0 段里没有「论坛」")
+    check("更新记录的 v2.1.0 段里写到了 PDF 总结",
+          "PDF" in _changelog.split("## v1.0.0")[0],
+          "v2.1.0 段里没有「PDF」")
 
     # ---- 软件内部打开文件夹 / 文件（不弹资源管理器）----
     folder_subject = context.library.create_subject("文件夹科目")
@@ -4191,12 +4417,29 @@ def main() -> int:
         app.processEvents()
     texts = {r: _agenda_text(r) for r in panel._rows}
     all_text = " ".join(_agenda_text(r) for r in panel._rows)
-    check("过期的 DDL 标注「已过期」", "已过期" in all_text, all_text[:240])
+    # 需求（v2.1）："超过DDL后，日程栏不再显示" ——
+    # 所以「状态-过期」这条**不该出现在列表里**，"已过期"文案自然也就不在。
+    # 它应该被算进面板上那句「另有 N 项已过 DDL」里。
+    _visible_names = " ".join(_row_title(r) for r in panel._rows)
+    check("**已过 DDL 的条目不再出现在日程栏**",
+          "状态-过期" not in _visible_names, _visible_names[:240])
+    check("**但它被数进了「已过 DDL」提示**",
+          panel.lbl_expired.isVisible() and "已过 DDL" in panel.lbl_expired.text(),
+          f"可见={panel.lbl_expired.isVisible()} 文本={panel.lbl_expired.text()!r}")
     check("临期的 DDL 标注「即将截止」", "即将截止" in all_text, all_text[:240])
     check("**30 小时内的 DDL 也标「即将截止」**（48 小时阈值）",
           all_text.count("即将截止") >= 2, all_text[:400])
-    check("已完成的条目显示「已完成」而不是过期 DDL",
-          "已完成" in all_text, all_text[:240])
+    # 「已完成」文案只在"显示了已完成条目"时才可能出现 ——
+    # 默认隐藏已完成，所以这里改成：取消勾选后必须能看到「已完成」而不是过期 DDL。
+    panel.check_hide_done.setChecked(False)
+    for _ in range(6):
+        app.processEvents()
+    _with_done = " ".join(_agenda_text(r) for r in panel._rows)
+    check("**取消隐藏后，已完成的条目显示「已完成」而不是过期 DDL**",
+          "已完成" in _with_done, _with_done[:240])
+    panel.check_hide_done.setChecked(True)
+    for _ in range(4):
+        app.processEvents()
 
     # 补一条"没有时间"的日程，验证「未设时间」文案
     no_due_item = context.schedule.add("没有时间的杂事")
@@ -4830,9 +5073,11 @@ def main() -> int:
     from gwp.ai.providers import web_bridge as _wb_bridge
 
     _wb_prompts: list = []
+    _wb_ai_kwargs: list = []
 
     def _fake_word_ai(prompt, **kwargs):
         _wb_prompts.append(prompt)
+        _wb_ai_kwargs.append(kwargs)
         return _json_wb.dumps({
             "english": "give up",
             "phonetic": "/ɡɪv ʌp/",
@@ -4844,17 +5089,43 @@ def main() -> int:
         }, ensure_ascii=False)
 
     _real_word_ai = _wb_bridge.send_to_ai
+    # 让 `has_direct_provider` 返回 True —— 这样补齐会走**后台线程**那条路。
+    # （真实环境里它取决于有没有配置 API Key；测试里直接打桩更可控。）
+    _real_has_direct = _wb_bridge.has_direct_provider
     _wb_bridge.send_to_ai = _fake_word_ai
+    _wb_bridge.has_direct_provider = lambda *a, **k: True
     _real_confirm = _wb_common.confirm
     _real_ask_text = _wb_common.ask_text
     _wb_common.confirm = lambda *a, **k: True          # 「现在就补齐吗」-> 是
     _wb_common.ask_text = lambda *a, **k: "give up"
+
+    def _wait_wordbook(view, limit_ms: int = 8000, done=None) -> None:
+        """等后台补齐任务跑完（离屏下必须真正转事件循环，见 pump 的说明）。
+
+        ``done`` 可以给一个"结果已经落盘"的判断：线程结束与"排队回来的
+        finished 信号被执行"之间还有一小段延迟，只看 ``is_completing``
+        可能刚好处在中间。
+        """
+        import time as _time
+
+        deadline = _time.time() + limit_ms / 1000.0
+        while _time.time() < deadline:
+            if done is not None:
+                if done():
+                    break
+            elif not view.is_completing:
+                break
+            pump(100)
+        pump(300)                 # 让排队回来的 finished 信号有机会执行
+
     try:
         _book_wb.add_word()
-        for _ in range(10):
-            app.processEvents()
+        pump(100)
+        # 补齐现在是异步的：add_word 返回时任务刚起步
+        _wait_wordbook(_book_wb)
     finally:
         _wb_bridge.send_to_ai = _real_word_ai
+        _wb_bridge.has_direct_provider = _real_has_direct
         _wb_common.confirm = _real_confirm
         _wb_common.ask_text = _real_ask_text
 
@@ -4874,6 +5145,15 @@ def main() -> int:
     check("单词书视图用的就是共用目录",
           _book_wb.folder() == context.paths.wordbook_dir,
           str(_book_wb.folder()))
+
+    # ---- 补齐必须在**后台线程**里跑（用户报障："会导致程序卡死"）----
+    check("**补齐期间界面没有被阻塞**（任务结束后 is_completing 归位）",
+          _book_wb.is_completing is False, str(_book_wb.is_completing))
+    check("**走后台线程时禁止弹粘贴框（allow_paste=False）**",
+          _wb_ai_kwargs and _wb_ai_kwargs[0].get("allow_paste") is False,
+          str(_wb_ai_kwargs[:1]))
+    check("后台补齐跑完后按钮恢复可用",
+          _book_wb.btn_add.isEnabled() and _book_wb.btn_complete.isEnabled())
 
     # **换一本书打开，卡片还在**（这正是"共用"的意义）
     _wb_book2 = context.library.create_book(_wb_subject.name, "英语2")
@@ -4982,6 +5262,120 @@ def main() -> int:
     _merged_wb = _wb2.merge_into(_book_wb.cards[0], _again)
     check("重新补齐不会覆盖用户改过的释义",
           _merged_wb.meaning == "我改过的释义", _merged_wb.meaning)
+
+    # ---- 「补齐全部」也必须异步；没配直连 AI 时要明确拒绝，不能逐张弹粘贴框 ----
+    _wb2.save_card(_wb2.WordCard(english="alpha"), context.paths.wordbook_dir)
+    _wb2.save_card(_wb2.WordCard(english="beta"), context.paths.wordbook_dir)
+    _book_wb.refresh()
+    for _ in range(4):
+        app.processEvents()
+
+    _infos: list = []
+    _real_info_wb = _wb_common.info
+    _wb_common.info = lambda *a, **k: _infos.append(str(a[1]) if len(a) > 1 else "")
+    # 注意：**必须重新打桩 send_to_ai**。上面那段用例结束时已经还原过了，
+    # 这里如果漏掉，就会走真实网络调用 —— 测试会一直卡着等、还不写盘。
+    # （我第一版就漏了这一次，症状是"AI 明明被调用了却没写回"。）
+    _wb_bridge.send_to_ai = _fake_word_ai
+    try:
+        # ① 没有可直连的 AI：应当**拒绝**批量补齐并说明原因
+        _wb_bridge.has_direct_provider = lambda *a, **k: False
+        _wb_common.confirm = lambda *a, **k: True
+        _calls_before = len(_wb_prompts)
+        _book_wb.complete_all()
+        pump(150)
+        check("**没配可直连 AI 时，「补齐全部」不会逐张弹粘贴框**",
+              len(_wb_prompts) == _calls_before,
+              f"send_to_ai 被调用 {len(_wb_prompts) - _calls_before} 次")
+        check("**并给出「需要配置 API」的明确说明**",
+              any("API" in text for text in _infos), str(_infos[-1:]))
+        check("被拒绝时没有起后台任务", _book_wb.is_completing is False)
+
+        # ② 有直连 AI：后台补齐，界面不阻塞
+        _wb_bridge.has_direct_provider = lambda *a, **k: True
+        _calls_before = len(_wb_prompts)
+        _book_wb.complete_all()
+        pump(100)
+        _wait_wordbook(
+            _book_wb,
+            done=lambda: all(
+                c.completed for c in _book_wb.cards
+                if c.english in ("alpha", "beta")
+            ),
+        )
+        _filled = {c.english: c for c in _book_wb.cards}
+        check("**「补齐全部」把每张缺释义的卡都补齐了**",
+              _filled.get("alpha") is not None
+              and _filled["alpha"].completed
+              and _filled["beta"].completed,
+              str({k: v.completed for k, v in _filled.items()}))
+        check("批量补齐确实为每张卡各调了一次 AI",
+              len(_wb_prompts) - _calls_before == 2,
+              f"新增调用 {len(_wb_prompts) - _calls_before} 次")
+        check("批量补齐同样禁止弹粘贴框",
+              _wb_ai_kwargs and _wb_ai_kwargs[-1].get("allow_paste") is False,
+              str(_wb_ai_kwargs[-1:]))
+    finally:
+        _wb_common.info = _real_info_wb
+        _wb_common.confirm = _real_confirm
+        _wb_bridge.has_direct_provider = _real_has_direct
+        _wb_bridge.send_to_ai = _real_word_ai
+
+    # ---- 回归：AI 调用必须在**后台线程**，不能在 GUI 线程里同步等 ----
+    #
+    # 用户的报障原话是"会导致程序卡死"。根因就是同步调 API：
+    # 界面线程一直等在网络返回上，点什么都没反应。
+    # 这里用"慢 0.4 秒的假 AI"来证明：派发是立即返回的，而且调用发生在别的线程。
+    from PyQt6.QtCore import QThread as _QThreadWb
+    import time as _time_wb
+
+    _wb_threads: list = []
+
+    def _slow_word_ai(prompt, **kwargs):
+        _wb_threads.append(_QThreadWb.currentThread())
+        _time_wb.sleep(0.4)                 # 模拟一次慢网络请求
+        return _json_wb.dumps({
+            "english": "gamma", "phonetic": "/ˈɡæmə/",
+            "part_of_speech": "n.", "meaning": "伽马",
+            "examples": "a gamma ray —— 一束伽马射线",
+        }, ensure_ascii=False)
+
+    _wb2.save_card(_wb2.WordCard(english="gamma"), context.paths.wordbook_dir)
+    _book_wb.refresh()
+    for _ in range(4):
+        app.processEvents()
+
+    _wb_bridge.send_to_ai = _slow_word_ai
+    _wb_bridge.has_direct_provider = lambda *a, **k: True
+    try:
+        _gamma = next(c for c in _book_wb.cards if c.english == "gamma")
+        _t0 = _time_wb.perf_counter()
+        _book_wb.complete_card(_gamma)
+        _dispatch_ms = (_time_wb.perf_counter() - _t0) * 1000
+        check("**发起补齐立即返回（不等网络，界面不会卡住）**",
+              _dispatch_ms < 300, f"{_dispatch_ms:.0f} ms")
+        # 网络还在跑的时候，界面线程必须还能转
+        _ui_ticked: list = []
+        from PyQt6.QtCore import QTimer as _QTimerWb
+        _QTimerWb.singleShot(50, lambda: _ui_ticked.append("ok"))
+        pump(120)
+        check("**AI 请求进行中，界面线程仍在处理事件**",
+              bool(_ui_ticked), str(_ui_ticked))
+        _wait_wordbook(
+            _book_wb,
+            done=lambda: any(
+                c.english == "gamma" and c.completed for c in _book_wb.cards
+            ),
+        )
+        check("**AI 调用发生在后台线程（不是 GUI 线程）**",
+              bool(_wb_threads) and all(t is not app.thread() for t in _wb_threads),
+              str(len(_wb_threads)))
+        check("后台补齐的结果照样写回了卡片",
+              any(c.english == "gamma" and c.completed for c in _book_wb.cards),
+              str({c.english: c.completed for c in _book_wb.cards}))
+    finally:
+        _wb_bridge.send_to_ai = _real_word_ai
+        _wb_bridge.has_direct_provider = _real_has_direct
 
     # 回到别的标签，单词书按钮应消失
     _wbv.tabs.setCurrentIndex(0)

@@ -1,6 +1,7 @@
 """gwp.data_manager 数据层。"""
 
 from gwp.data_manager.cache import ScanCache
+from gwp.data_manager.forum_store import Forum
 from gwp.data_manager.models import Book, BookItem, Subject
 from gwp.data_manager.store import (
     DataError,
@@ -17,6 +18,7 @@ __all__ = [
     "Book",
     "BookItem",
     "DataError",
+    "Forum",
     "Library",
     "ScanCache",
     "Subject",
