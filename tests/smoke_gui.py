@@ -4483,7 +4483,7 @@ def main() -> int:
     for _ in range(6):
         app.processEvents()
 
-    # ---- AI 助手自称「长庚」（需求：不要叫"大白星球"）----
+    # ---- AI 助手自称「长庚」（需求：不要叫软件名）----
     from gwp.core import constants as _C2
 
     _prompt_names = [
@@ -4496,9 +4496,14 @@ def main() -> int:
           all(_C2.AI_ASSISTANT_NAME in getattr(_C2, n) for n in _prompt_names),
           str([n for n in _prompt_names
                if _C2.AI_ASSISTANT_NAME not in getattr(_C2, n)]))
-    check("没有任何提示词把软件名当成助手名字",
-          all("大白星球" not in getattr(_C2, n) for n in _prompt_names),
-          str([n for n in _prompt_names if "大白星球" in getattr(_C2, n)]))
+    check("**没有任何提示词把软件名当成助手名字**（新旧两个中文名都查）",
+          all(
+              "太白金星" not in getattr(_C2, n)
+              and "大白星球" not in getattr(_C2, n)
+              for n in _prompt_names
+          ),
+          str([n for n in _prompt_names
+               if "太白金星" in getattr(_C2, n) or "大白星球" in getattr(_C2, n)]))
     check("默认配置里的提示词也用的是新名字",
           _C2.AI_ASSISTANT_NAME in str(context.config.get("prompts.summary_system")),
           str(context.config.get("prompts.summary_system"))[:60])

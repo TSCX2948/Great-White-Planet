@@ -1122,7 +1122,8 @@ def main() -> int:
           str(library.home_sequence(refresh=True)[:3]))
 
     # ------------------------------------------------ AI 助手自称「长庚」
-    # 需求：软件里的所有 AI 助手要自称长庚，不要叫「大白星球」（那是太白金星）。
+    # 需求：软件里的所有 AI 助手要自称长庚，不要叫软件名
+    #（软件名 = 太白金星 / Great White Planet；早期文档写作「大白星球」）。
     prompt_names = [
         name for name in dir(C)
         if "PROMPT" in name and isinstance(getattr(C, name), str)
@@ -1135,9 +1136,13 @@ def main() -> int:
           all(C.AI_ASSISTANT_NAME in getattr(C, n) for n in prompt_names),
           str([n for n in prompt_names
                if C.AI_ASSISTANT_NAME not in getattr(C, n)]))
-    check("没有任何提示词把软件名当成助手名字",
-          all("大白星球" not in getattr(C, n) for n in prompt_names),
-          str([n for n in prompt_names if "大白星球" in getattr(C, n)]))
+    check("**没有任何提示词把软件名当成助手名字**（新旧两个中文名都查）",
+          all(
+              "太白金星" not in getattr(C, n) and "大白星球" not in getattr(C, n)
+              for n in prompt_names
+          ),
+          str([n for n in prompt_names
+               if "太白金星" in getattr(C, n) or "大白星球" in getattr(C, n)]))
     check("提示词有版本号（改动可以被老用户感知）",
           int(C.PROMPT_REVISION) >= 1, str(C.PROMPT_REVISION))
 
